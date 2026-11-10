@@ -1,0 +1,13 @@
+# Finora backend
+
+Express + MongoDB (Mongoose). Environment variables: see `.env.example` (`MONGODB_URI`, `MONGODB_DB`, `CLIENT_ORIGIN`, `SYNC_API_KEY`).
+
+## API (no login)
+- `GET/POST /api/sales`, `PATCH/DELETE /api/sales/:invoiceNumber` (marking Paid stores `paidAt`)
+- `GET/POST /api/expenses`, `DELETE /api/expenses/:id`
+- `GET /api/budgets`, `PUT /api/budgets/:category`
+- `GET/PUT /api/settings` (business name, portfolio link)
+- `POST /api/integrations/sales` with the `x-sync-key` header
+- `GET /api/health`
+
+There is no authentication, so anyone who knows the backend URL can read and change the data. Keep the URL private, or protect the deployment (for example Vercel Deployment Protection).
