@@ -1,10 +1,13 @@
 import { Router } from "express";
-import { Sale, Expense, Budget, Settings, CATEGORIES } from "../models/index.js";
-import { asyncRoute, clean, toDate } from "../lib/util.js";
+import { Sale, Expense, Budget, Settings, Work, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
+import { asyncRoute, clean, toDate, escapeRegex } from "../lib/util.js";
+import { money2, settle, balanceOf } from "../lib/payments.js";
+import { notifyCustomer } from "../lib/notify.js";
 
-export const API_VERSION = "3.1.0"; // frontend checks this to detect an outdated deployment
+export const API_VERSION = "4.0.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
-const STATUSES = ["Paid", "Pending", "Overdue", "Cancelled"];
+const STATUSES = ["Paid", "Partial", "Pending", "Overdue", "Cancelled"];
+const METHODS = ["Cash", "Bank Transfer", "Card", "Online", "Cheque", "Not recorded"];
 
 // Next invoice number: INV-1001, INV-1002, ...
 async function nextInvoiceNumber() {
@@ -22,6 +25,8 @@ function buildSale(input, { partial = false } = {}) {
   if (!partial || has("service")) doc.service = clean(input.service ?? input.itemName);
   if (!partial || has("amount")) doc.amount = Number(input.amount ?? input.total);
   if (has("customerEmail")) doc.customerEmail = clean(input.customerEmail);
+  if (has("house")) doc.house = clean(input.house);
+  if (has("address")) doc.address = clean(input.address);
   if (has("customerPhone")) {
     doc.customerPhone = clean(input.customerPhone);
     const digits = doc.customerPhone.replace(/\D/g, "");
@@ -30,7 +35,7 @@ function buildSale(input, { partial = false } = {}) {
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("dueDate")) doc.dueDate = toDate(input.dueDate) || null;
   if (has("status")) {
-    if (!STATUSES.includes(input.status)) return { error: "Status must be Paid, Pending, Overdue or Cancelled." };
+    if (!STATUSES.includes(input.status)) return { error: "Status must be Paid, Partial, Pending, Overdue or Cancelled." };
     doc.status = input.status;
   }
   if (has("paidAt")) doc.paidAt = toDate(input.paidAt) || null;
@@ -54,6 +59,37 @@ router.get("/health", (req, res) =>
   res.json({ ok: true, database: req.app.locals.dbReady ? "connected" : "disconnected", service: "Finora API", version: API_VERSION, ...(req.app.locals.dbReady ? {} : { reason: req.app.locals.dbError || "unknown" }) })
 );
 
+// Old invoices were marked "Paid" without a payment list. Turn that into one full payment before any change.
+function materializeLegacy(sale) {
+  if (sale.status === "Paid" && sale.payments.length === 0 && sale.amount > 0) {
+    sale.payments.push({ amount: sale.amount, date: sale.paidAt || sale.date || new Date(), method: sale.method && sale.method !== "Not recorded" ? sale.method : "Cash" });
+  }
+}
+
+// Money already received when a sale is created: the whole amount if status is Paid, or "paidNow" for a part payment.
+function initialPayments(input, doc) {
+  let paid = input.status === "Paid" ? doc.amount : Number(input.paidNow ?? input.paidAmount ?? 0);
+  if (!Number.isFinite(paid) || paid < 0) return { error: "Amount received must be zero or more." };
+  if (paid > doc.amount) return { error: "Amount received cannot be more than the invoice amount." };
+  paid = money2(paid);
+  const method = doc.method && doc.method !== "Not recorded" ? doc.method : "Cash";
+  return { payments: paid > 0 ? [{ amount: paid, date: doc.date || new Date(), method }] : [] };
+}
+
+async function createSale(input, reference) {
+  const { doc, error } = buildSale(input || {});
+  if (error) return { error };
+  const init = initialPayments(input, doc);
+  if (init.error) return { error: init.error };
+  doc.status = input.status === "Cancelled" ? "Cancelled" : "Pending";
+  delete doc.paidAt;
+  if (!doc.date) doc.date = new Date();
+  const sale = new Sale({ ...doc, payments: init.payments, reference });
+  settle(sale);
+  await sale.save();
+  return { sale };
+}
+
 // Service-provider webhook: POST /api/integrations/sales with the x-sync-key header.
 router.post("/integrations/sales", asyncRoute(async (req, res) => {
   const expected = process.env.SYNC_API_KEY;
@@ -61,11 +97,9 @@ router.post("/integrations/sales", asyncRoute(async (req, res) => {
   const incoming = Array.isArray(req.body) ? req.body : [req.body];
   const saved = [];
   for (const item of incoming) {
-    const { doc, error } = buildSale(item || {});
+    const { sale, error } = await createSale(item || {}, clean(item?.reference) || (await nextInvoiceNumber()));
     if (error) return res.status(400).json({ message: error, received: saved.length });
-    const reference = clean(item.reference) || (await nextInvoiceNumber());
-    if (doc.status === "Paid" && !doc.paidAt) doc.paidAt = doc.date || new Date();
-    saved.push(await Sale.create({ ...doc, reference }));
+    saved.push(sale);
   }
   res.status(201).json({ received: saved.length, records: saved.map(x => x.toJSON()) });
 }));
@@ -77,37 +111,88 @@ router.get("/sales", asyncRoute(async (req, res) => {
   res.json(docs.map(d => d.toJSON()));
 }));
 
-// Create a sale / invoice
+// Create a sale / invoice. Optional: paidNow (part payment received at creation).
 router.post("/sales", asyncRoute(async (req, res) => {
-  const { doc, error } = buildSale(req.body || {});
-  if (error) return res.status(400).json({ message: error });
-  if (!doc.date) doc.date = new Date();
-  if (doc.status === "Paid" && !doc.paidAt) doc.paidAt = doc.date;
-
-  // Retry once if two invoices are created at the same moment and get the same number.
+  // Retry if two invoices are created at the same moment and get the same number.
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const sale = await Sale.create({ ...doc, reference: clean(req.body.reference) || (await nextInvoiceNumber()) });
+      const { sale, error } = await createSale(req.body, clean(req.body?.reference) || (await nextInvoiceNumber()));
+      if (error) return res.status(400).json({ message: error });
       return res.status(201).json(sale.toJSON());
     } catch (err) {
-      if (err.code !== 11000 || req.body.reference) throw err;
+      if (err.code !== 11000 || req.body?.reference) throw err;
     }
   }
   res.status(409).json({ message: "Could not generate a unique invoice number. Please try again." });
 }));
 
-// Update a sale (e.g. mark as paid) — :id is the invoice number
+const dayText = d => (d ? new Date(d).toISOString().slice(0, 10) : "none");
+
+// Update a sale — :id is the invoice number. Status follows the payments; asking for "Paid" records the remaining balance as a payment.
+// Returns the sale plus `notification` (the WhatsApp message that was sent, or ready to send) when the customer should hear about the change.
 router.patch("/sales/:id", asyncRoute(async (req, res) => {
   const { doc, error } = buildSale(req.body || {}, { partial: true });
   if (error) return res.status(400).json({ message: error });
-  const update = { $set: doc };
-  if (doc.status === "Paid") {
-    const current = await Sale.findOne({ reference: req.params.id }).select("status paidAt").lean();
-    if (current && !(current.status === "Paid" && current.paidAt) && !doc.paidAt) doc.paidAt = new Date();
-  } else if (doc.status) { delete doc.paidAt; update.$unset = { paidAt: 1 }; }
-  const sale = await Sale.findOneAndUpdate({ reference: req.params.id }, update, { new: true, runValidators: true });
+  const sale = await Sale.findOne({ reference: req.params.id });
   if (!sale) return res.status(404).json({ message: "Invoice not found." });
-  res.json(sale.toJSON());
+  materializeLegacy(sale);
+  const before = { amount: sale.amount, dueDate: dayText(sale.dueDate), service: sale.service, status: sale.status };
+
+  const want = doc.status; delete doc.status; delete doc.paidAt;
+  Object.assign(sale, doc);
+  if (want && want !== "Cancelled" && sale.status === "Cancelled") sale.status = "Pending";
+  let added = 0;
+  if (want === "Cancelled") sale.status = "Cancelled";
+  else if (want === "Paid") {
+    added = balanceOf(sale);
+    if (added > 0) sale.payments.push({ amount: added, date: new Date(), method: doc.method && doc.method !== "Not recorded" ? doc.method : "Bank Transfer" });
+  } else if (want === "Pending") sale.payments = [];
+  settle(sale);
+  await sale.save();
+
+  const changes = [];
+  if (sale.amount !== before.amount) changes.push(`Amount changed: ${Math.round(before.amount).toLocaleString("en-US")} to ${Math.round(sale.amount).toLocaleString("en-US")}`);
+  if (dayText(sale.dueDate) !== before.dueDate) changes.push(`New due date: ${dayText(sale.dueDate)}`);
+  if (sale.service !== before.service) changes.push(`Service: ${sale.service}`);
+  let notification = null;
+  if (added > 0) notification = await notifyCustomer("payment", sale, { amount: added });
+  else if (want === "Cancelled" && before.status !== "Cancelled") notification = await notifyCustomer("cancelled", sale);
+  else if (changes.length) notification = await notifyCustomer("updated", sale, { changes });
+  res.json({ ...sale.toJSON(), notification });
+}));
+
+// Record a (part) payment: POST /api/sales/INV-1001/payments { amount, method?, date?, note? }
+router.post("/sales/:id/payments", asyncRoute(async (req, res) => {
+  const amount = money2(req.body?.amount);
+  if (!(amount > 0)) return res.status(400).json({ message: "Payment amount must be greater than zero." });
+  const sale = await Sale.findOne({ reference: req.params.id });
+  if (!sale) return res.status(404).json({ message: "Invoice not found." });
+  if (sale.status === "Cancelled") return res.status(400).json({ message: "A cancelled invoice cannot take payments." });
+  materializeLegacy(sale);
+  const left = balanceOf(sale);
+  if (left <= 0) return res.status(400).json({ message: "This invoice is already paid in full." });
+  if (amount > left + 0.001) return res.status(400).json({ message: `Payment is more than the remaining balance (${left}).` });
+  const method = METHODS.includes(req.body?.method) ? req.body.method : "Cash";
+  sale.payments.push({ amount, date: toDate(req.body?.date) || new Date(), method, note: clean(req.body?.note) });
+  sale.method = method;
+  settle(sale);
+  await sale.save();
+  const notification = await notifyCustomer("payment", sale, { amount });
+  res.status(201).json({ ...sale.toJSON(), notification });
+}));
+
+// Remove a wrongly entered payment.
+router.delete("/sales/:id/payments/:pid", asyncRoute(async (req, res) => {
+  const sale = await Sale.findOne({ reference: req.params.id });
+  if (!sale) return res.status(404).json({ message: "Invoice not found." });
+  materializeLegacy(sale);
+  const p = req.params.pid === "full" ? sale.payments[0] : sale.payments.id(req.params.pid);
+  if (!p) return res.status(404).json({ message: "Payment not found." });
+  sale.payments.pull(p._id);
+  settle(sale);
+  await sale.save();
+  const notification = await notifyCustomer("payment-removed", sale);
+  res.json({ ...sale.toJSON(), notification });
 }));
 
 router.delete("/sales/:id", asyncRoute(async (req, res) => {
@@ -121,6 +206,8 @@ function buildExpense(input, { partial = false } = {}) {
   const doc = {};
   const has = k => input[k] !== undefined;
   if (!partial || has("title")) { doc.title = clean(input.title); if (!doc.title) return { error: "Title is required." }; }
+  if (has("payee")) doc.payee = clean(input.payee);
+  if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
   if (!partial || has("amount")) { doc.amount = Number(input.amount); if (!Number.isFinite(doc.amount) || doc.amount <= 0) return { error: "Amount must be greater than zero." }; }
   if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
   if (has("date")) doc.date = toDate(input.date) || new Date();
@@ -133,6 +220,10 @@ router.get("/expenses", asyncRoute(async (req, res) => {
   const q = {};
   const from = toDate(req.query.from), to = toDate(req.query.to);
   if (from || to) q.date = { ...(from && { $gte: from }), ...(to && { $lte: to }) };
+  // ?q=ali searches the person (employee / seller), title, category and notes. ?payee=Ali matches one person exactly.
+  const text = clean(req.query.q).slice(0, 80);
+  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ payee: rx }, { title: rx }, { category: rx }, { notes: rx }]; }
+  if (clean(req.query.payee)) q.payee = new RegExp(`^${escapeRegex(clean(req.query.payee))}$`, "i");
   res.json((await Expense.find(q).sort({ date: -1 }).limit(2000)).map(d => d.toJSON()));
 }));
 router.post("/expenses", asyncRoute(async (req, res) => {
@@ -154,6 +245,73 @@ router.put("/budgets/:category", asyncRoute(async (req, res) => {
   if (!Number.isFinite(limit) || limit < 0) return res.status(400).json({ message: "Limit must be zero or more." });
   const b = await Budget.findOneAndUpdate({ category: req.params.category }, { $set: { limit } }, { upsert: true, new: true, runValidators: true });
   res.json(b.toJSON());
+}));
+
+// ---------- Construction work (area x rate) and working permissions ----------
+function buildWork(input, { partial = false } = {}) {
+  const doc = {};
+  const has = k => input[k] !== undefined;
+  if (!partial || has("employee")) { doc.employee = clean(input.employee); if (!doc.employee) return { error: "Employee name is required." }; }
+  if (!partial || has("site")) { doc.site = clean(input.site); if (!doc.site) return { error: "Area / site is required." }; }
+  if (!partial || has("areaSqft")) { doc.areaSqft = Number(input.areaSqft); if (!Number.isFinite(doc.areaSqft) || doc.areaSqft <= 0) return { error: "Area (sq ft) must be greater than zero." }; }
+  if (!partial || has("ratePerSqft")) { doc.ratePerSqft = Number(input.ratePerSqft); if (!Number.isFinite(doc.ratePerSqft) || doc.ratePerSqft <= 0) return { error: "Rate per sq ft must be greater than zero." }; }
+  if (has("employeePhone")) doc.employeePhone = clean(input.employeePhone);
+  if (has("status")) { if (!["Active", "Completed", "Cancelled"].includes(input.status)) return { error: "Status must be Active, Completed or Cancelled." }; doc.status = input.status; }
+  if (has("startedOn")) doc.startedOn = toDate(input.startedOn) || null;
+  if (has("permitNo")) doc.permitNo = clean(input.permitNo);
+  if (has("permitAuthority")) doc.permitAuthority = clean(input.permitAuthority);
+  if (has("permitStart")) doc.permitStart = toDate(input.permitStart) || null;
+  if (has("permitDue")) doc.permitDue = toDate(input.permitDue) || null;
+  if (has("notes")) doc.notes = clean(input.notes);
+  if (doc.permitStart && doc.permitDue && doc.permitDue < doc.permitStart) return { error: "Permission due date cannot be before its start date." };
+  return { doc };
+}
+
+router.get("/works", asyncRoute(async (req, res) => {
+  const q = {};
+  const text = clean(req.query.q).slice(0, 80);
+  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ employee: rx }, { site: rx }, { permitNo: rx }]; }
+  res.json((await Work.find(q).sort({ permitDue: 1, createdAt: -1 }).limit(2000)).map(w => w.toJSON()));
+}));
+router.post("/works", asyncRoute(async (req, res) => {
+  const { doc, error } = buildWork(req.body || {});
+  if (error) return res.status(400).json({ message: error });
+  doc.amount = money2(doc.areaSqft * doc.ratePerSqft);
+  res.status(201).json((await Work.create(doc)).toJSON());
+}));
+router.patch("/works/:id", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
+  const { doc, error } = buildWork(req.body || {}, { partial: true });
+  if (error) return res.status(400).json({ message: error });
+  const work = await Work.findById(req.params.id);
+  if (!work) return res.status(404).json({ message: "Work not found." });
+  Object.assign(work, doc);
+  if (work.permitStart && work.permitDue && work.permitDue < work.permitStart) return res.status(400).json({ message: "Permission due date cannot be before its start date." });
+  work.amount = money2(work.areaSqft * work.ratePerSqft);
+  await work.save();
+  res.json(work.toJSON());
+}));
+// Renew the working permission: the old period is kept in permitHistory, the new dates become current.
+router.post("/works/:id/renew", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
+  const start = toDate(req.body?.permitStart), due = toDate(req.body?.permitDue);
+  if (!due) return res.status(400).json({ message: "Enter the new permission due date." });
+  if (start && due < start) return res.status(400).json({ message: "Permission due date cannot be before its start date." });
+  const work = await Work.findById(req.params.id);
+  if (!work) return res.status(404).json({ message: "Work not found." });
+  if (work.permitDue || work.permitStart || work.permitNo) work.permitHistory.push({ permitNo: work.permitNo, permitStart: work.permitStart, permitDue: work.permitDue, note: clean(req.body?.note) });
+  work.permitStart = start || new Date();
+  work.permitDue = due;
+  if (req.body?.permitNo !== undefined) work.permitNo = clean(req.body.permitNo);
+  if (req.body?.permitAuthority !== undefined) work.permitAuthority = clean(req.body.permitAuthority);
+  await work.save();
+  res.json(work.toJSON());
+}));
+router.delete("/works/:id", asyncRoute(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
+  const w = await Work.findByIdAndDelete(req.params.id);
+  if (!w) return res.status(404).json({ message: "Work not found." });
+  res.json({ deleted: req.params.id });
 }));
 
 // ---------- Business settings (stored in the database) ----------

@@ -5,3 +5,4 @@ export const toDate = value => {
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? undefined : d;
 };
+export const escapeRegex = s => String(s ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
