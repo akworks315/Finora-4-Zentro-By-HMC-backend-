@@ -14,6 +14,8 @@ Express + MongoDB (Mongoose). Deployed on Vercel: https://finora-4-zentro-by-hmc
 - `POST /api/sales/:invoiceNumber/payments` `{ amount, method, date, note }`: record a part or full payment
 - `DELETE /api/sales/:invoiceNumber/payments/:paymentId`: remove a wrongly entered payment
 - `GET/POST /api/expenses` (`payee`, `payeeType`; search with `?q=name` or `?payee=Exact Name`), `DELETE /api/expenses/:id`
+- `GET/POST /api/payables`, `PATCH/DELETE /api/payables/:id`: bills you owe to an employee / seller (`payee`, `payeePhone`, `title`, `amount`, `dueDate`, optional `paidNow`)
+  - `POST /api/payables/:id/payments`, `DELETE /api/payables/:id/payments/:paymentId`: part payments; each one counts as an expense and the person gets a WhatsApp update
 - `GET/POST /api/works`, `PATCH/DELETE /api/works/:id`: construction work (area × rate) and working permission dates
 - `POST /api/works/:id/renew` `{ permitStart, permitDue, permitNo, note }`: renew a permission (old period kept in history)
 - `GET /api/budgets`, `PUT /api/budgets/:category`

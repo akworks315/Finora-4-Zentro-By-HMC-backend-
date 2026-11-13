@@ -59,16 +59,31 @@ async function post(to, body) {
   finally { clearTimeout(timer); }
 }
 
-// Never throws: a failed message must not undo the payment that was just saved.
-export async function notifyCustomer(kind, sale, extra) {
-  const text = buildMessage(kind, sale, extra);
-  const to = waNumber(sale.customerPhone);
+async function deliver(phone, text, label) {
+  const to = waNumber(phone);
   const out = { text, to, sent: false, reason: "" };
-  if (!to) { out.reason = "No WhatsApp number saved for this customer."; return out; }
+  if (!to) { out.reason = "No WhatsApp number saved."; return out; }
   if (!process.env.WHATSAPP_TOKEN || !process.env.WHATSAPP_PHONE_ID) { out.reason = "Automatic WhatsApp is not set up on the server."; return out; }
   const r = await post(to, text);
   out.sent = r.ok; out.reason = r.ok ? "" : r.reason;
   const owner = waNumber(process.env.WHATSAPP_OWNER);
-  if (r.ok && owner && owner !== to) await post(owner, `[Copy] ${sale.customer}\n${text}`);
+  if (r.ok && owner && owner !== to) await post(owner, `[Copy] ${label}\n${text}`);
   return out;
 }
+
+// Never throws: a failed message must not undo the payment that was just saved.
+export const notifyCustomer = (kind, sale, extra) => deliver(sale.customerPhone, buildMessage(kind, sale, extra), sale.customer);
+
+// Messages for the person YOU pay (employee / seller / contractor) about a bill.
+export function buildPayeeMessage(kind, bill, extra = {}) {
+  const balance = Math.max(0, money2(bill.amount - (bill.paidAmount || 0)));
+  const head = `Hello ${bill.payee},`, foot = "Thank you.";
+  const state = [`Total agreed: ${fmt(bill.amount)}`, `Paid so far: ${fmt(bill.paidAmount)}`, balance > 0 ? `Remaining: ${fmt(balance)}${bill.dueDate ? ` (due ${day(bill.dueDate)})` : ""}` : "Status: PAID IN FULL"];
+  switch (kind) {
+    case "payment": return [head, `We have paid you ${fmt(extra.amount)} for "${bill.title}".`, ...state, foot].join("\n");
+    case "payment-removed": return [head, `A payment entry for "${bill.title}" was corrected.`, ...state, foot].join("\n");
+    case "cancelled": return [head, `The payment for "${bill.title}" has been cancelled.`, foot].join("\n");
+    default: return [head, `Your payment details for "${bill.title}" were updated.`, ...(extra.changes || []), ...state, foot].join("\n");
+  }
+}
+export const notifyPayee = (kind, bill, extra) => deliver(bill.payeePhone, buildPayeeMessage(kind, bill, extra), bill.payee);

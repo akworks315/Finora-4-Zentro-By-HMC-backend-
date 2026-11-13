@@ -66,6 +66,38 @@ const expenseSchema = new mongoose.Schema(
 );
 export const Expense = mongoose.model("Expense", expenseSchema);
 
+// A bill you owe to a person (employee, seller, contractor). It can be paid in parts; every payment is money spent (an expense).
+const payableSchema = new mongoose.Schema(
+  {
+    payee: { type: String, required: true, trim: true, index: true },
+    payeePhone: { type: String, default: "", trim: true },          // WhatsApp number of the person you pay
+    payeeType: { type: String, enum: PAYEE_TYPES, default: "Other" },
+    title: { type: String, required: true, trim: true },             // what the payment is for
+    category: { type: String, enum: CATEGORIES, default: "Other", index: true },
+    amount: { type: Number, required: true, min: 0 },                // total you have to pay
+    date: { type: Date, default: Date.now },
+    dueDate: { type: Date },
+    paidAt: { type: Date },
+    paidAmount: { type: Number, default: 0, min: 0 },
+    payments: { type: [paymentSchema], default: [] },
+    status: { type: String, enum: ["Paid", "Partial", "Pending", "Cancelled"], default: "Pending", index: true },
+    method: { type: String, default: "Not recorded" },
+    notes: { type: String, default: "" }
+  },
+  {
+    timestamps: true, versionKey: false,
+    toJSON: {
+      transform(_d, ret) {
+        ret.id = String(ret._id); delete ret._id;
+        ret.payments = (ret.payments || []).map(p => ({ id: String(p._id), amount: p.amount, date: p.date, method: p.method, note: p.note || "" }));
+        ret.paidAmount = ret.payments.reduce((a, p) => a + p.amount, 0);
+        ret.balance = Math.max(0, Math.round((ret.amount - ret.paidAmount) * 100) / 100);
+      }
+    }
+  }
+);
+export const Payable = mongoose.model("Payable", payableSchema);
+
 // One monthly limit per category.
 const budgetSchema = new mongoose.Schema(
   { category: { type: String, enum: CATEGORIES, unique: true, required: true }, limit: { type: Number, required: true, min: 0 } },

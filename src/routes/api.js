@@ -1,8 +1,8 @@
 import { Router } from "express";
-import { Sale, Expense, Budget, Settings, Work, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
+import { Sale, Expense, Budget, Settings, Work, Payable, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
 import { asyncRoute, clean, toDate, escapeRegex } from "../lib/util.js";
 import { money2, settle, balanceOf } from "../lib/payments.js";
-import { notifyCustomer } from "../lib/notify.js";
+import { notifyCustomer, notifyPayee } from "../lib/notify.js";
 
 export const API_VERSION = "4.0.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
@@ -245,6 +245,118 @@ router.put("/budgets/:category", asyncRoute(async (req, res) => {
   if (!Number.isFinite(limit) || limit < 0) return res.status(400).json({ message: "Limit must be zero or more." });
   const b = await Budget.findOneAndUpdate({ category: req.params.category }, { $set: { limit } }, { upsert: true, new: true, runValidators: true });
   res.json(b.toJSON());
+}));
+
+// ---------- Bills to pay (money you owe to employees / sellers), with part payments ----------
+const isId = id => /^[a-f\d]{24}$/i.test(id);
+function buildBill(input, { partial = false } = {}) {
+  const doc = {};
+  const has = k => input[k] !== undefined;
+  if (!partial || has("payee")) { doc.payee = clean(input.payee); if (!doc.payee) return { error: "Enter the name of the person you are paying." }; }
+  if (!partial || has("title")) { doc.title = clean(input.title); if (!doc.title) return { error: "Enter what the payment is for." }; }
+  if (!partial || has("amount")) { doc.amount = Number(input.amount); if (!Number.isFinite(doc.amount) || doc.amount <= 0) return { error: "Amount must be greater than zero." }; }
+  if (has("payeePhone")) {
+    doc.payeePhone = clean(input.payeePhone);
+    const digits = doc.payeePhone.replace(/\D/g, "");
+    if (doc.payeePhone && (!/^[+\d][\d\s\-()]*$/.test(doc.payeePhone) || digits.length < 7 || digits.length > 15)) return { error: "WhatsApp number must be 7 to 15 digits, e.g. 0300 1234567." };
+  }
+  if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
+  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
+  if (has("date")) doc.date = toDate(input.date) || new Date();
+  if (has("dueDate")) doc.dueDate = toDate(input.dueDate) || null;
+  if (has("method")) doc.method = clean(input.method) || "Not recorded";
+  if (has("notes")) doc.notes = clean(input.notes);
+  if (has("status") && !["Paid", "Partial", "Pending", "Cancelled", "Overdue"].includes(input.status)) return { error: "Unknown status." };
+  return { doc };
+}
+
+router.get("/payables", asyncRoute(async (req, res) => {
+  const q = {};
+  const text = clean(req.query.q).slice(0, 80);
+  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ payee: rx }, { title: rx }, { category: rx }]; }
+  res.json((await Payable.find(q).sort({ date: -1, createdAt: -1 }).limit(2000)).map(b => b.toJSON()));
+}));
+
+router.post("/payables", asyncRoute(async (req, res) => {
+  const { doc, error } = buildBill(req.body || {});
+  if (error) return res.status(400).json({ message: error });
+  let paid = Number(req.body?.paidNow ?? 0);
+  if (!Number.isFinite(paid) || paid < 0) return res.status(400).json({ message: "Amount paid must be zero or more." });
+  if (paid > doc.amount) return res.status(400).json({ message: "Amount paid cannot be more than the total." });
+  paid = money2(paid);
+  const method = METHODS.includes(doc.method) && doc.method !== "Not recorded" ? doc.method : "Cash";
+  const bill = new Payable({ ...doc, status: "Pending", date: doc.date || new Date(), payments: paid > 0 ? [{ amount: paid, date: doc.date || new Date(), method }] : [] });
+  settle(bill);
+  await bill.save();
+  res.status(201).json(bill.toJSON());
+}));
+
+// Update a bill. Asking for "Paid" records the remaining balance as a payment. Returns `notification` when the person should hear about it.
+router.patch("/payables/:id", asyncRoute(async (req, res) => {
+  if (!isId(req.params.id)) return res.status(404).json({ message: "Bill not found." });
+  const { doc, error } = buildBill(req.body || {}, { partial: true });
+  if (error) return res.status(400).json({ message: error });
+  const bill = await Payable.findById(req.params.id);
+  if (!bill) return res.status(404).json({ message: "Bill not found." });
+  const before = { amount: bill.amount, dueDate: dayText(bill.dueDate), title: bill.title, status: bill.status };
+  const want = req.body?.status; delete doc.status;
+  Object.assign(bill, doc);
+  if (want && want !== "Cancelled" && bill.status === "Cancelled") bill.status = "Pending";
+  let added = 0;
+  if (want === "Cancelled") bill.status = "Cancelled";
+  else if (want === "Paid") {
+    added = balanceOf(bill);
+    if (added > 0) bill.payments.push({ amount: added, date: new Date(), method: METHODS.includes(doc.method) && doc.method !== "Not recorded" ? doc.method : "Cash" });
+  }
+  settle(bill);
+  await bill.save();
+  const changes = [];
+  if (bill.amount !== before.amount) changes.push(`Total changed: ${Math.round(before.amount).toLocaleString("en-US")} to ${Math.round(bill.amount).toLocaleString("en-US")}`);
+  if (dayText(bill.dueDate) !== before.dueDate) changes.push(`New due date: ${dayText(bill.dueDate)}`);
+  let notification = null;
+  if (added > 0) notification = await notifyPayee("payment", bill, { amount: added });
+  else if (want === "Cancelled" && before.status !== "Cancelled") notification = await notifyPayee("cancelled", bill);
+  else if (changes.length) notification = await notifyPayee("updated", bill, { changes });
+  res.json({ ...bill.toJSON(), notification });
+}));
+
+router.post("/payables/:id/payments", asyncRoute(async (req, res) => {
+  if (!isId(req.params.id)) return res.status(404).json({ message: "Bill not found." });
+  const amount = money2(req.body?.amount);
+  if (!(amount > 0)) return res.status(400).json({ message: "Payment amount must be greater than zero." });
+  const bill = await Payable.findById(req.params.id);
+  if (!bill) return res.status(404).json({ message: "Bill not found." });
+  if (bill.status === "Cancelled") return res.status(400).json({ message: "A cancelled bill cannot take payments." });
+  const left = balanceOf(bill);
+  if (left <= 0) return res.status(400).json({ message: "This bill is already paid in full." });
+  if (amount > left + 0.001) return res.status(400).json({ message: `Payment is more than the remaining balance (${left}).` });
+  const method = METHODS.includes(req.body?.method) ? req.body.method : "Cash";
+  bill.payments.push({ amount, date: toDate(req.body?.date) || new Date(), method, note: clean(req.body?.note) });
+  bill.method = method;
+  settle(bill);
+  await bill.save();
+  const notification = await notifyPayee("payment", bill, { amount });
+  res.status(201).json({ ...bill.toJSON(), notification });
+}));
+
+router.delete("/payables/:id/payments/:pid", asyncRoute(async (req, res) => {
+  if (!isId(req.params.id)) return res.status(404).json({ message: "Bill not found." });
+  const bill = await Payable.findById(req.params.id);
+  if (!bill) return res.status(404).json({ message: "Bill not found." });
+  const p = bill.payments.id(req.params.pid);
+  if (!p) return res.status(404).json({ message: "Payment not found." });
+  bill.payments.pull(p._id);
+  settle(bill);
+  await bill.save();
+  const notification = await notifyPayee("payment-removed", bill);
+  res.json({ ...bill.toJSON(), notification });
+}));
+
+router.delete("/payables/:id", asyncRoute(async (req, res) => {
+  if (!isId(req.params.id)) return res.status(404).json({ message: "Bill not found." });
+  const b = await Payable.findByIdAndDelete(req.params.id);
+  if (!b) return res.status(404).json({ message: "Bill not found." });
+  res.json({ deleted: req.params.id });
 }));
 
 // ---------- Construction work (area x rate) and working permissions ----------
