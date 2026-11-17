@@ -8,7 +8,7 @@ import api from "./routes/api.js";
 
 const app = express();
 app.disable("x-powered-by");
-app.use(helmet());
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 // Lets the online website reach a backend running on your own computer (Chrome "private network" check).
 app.use((req, res, next) => { if (req.get("access-control-request-private-network")) res.set("Access-Control-Allow-Private-Network", "true"); next(); });
 

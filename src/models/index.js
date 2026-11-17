@@ -56,7 +56,7 @@ const expenseSchema = new mongoose.Schema(
     title: { type: String, required: true, trim: true },
     payee: { type: String, default: "", trim: true, index: true },   // who the money went to: employee, seller, contractor...
     payeeType: { type: String, enum: PAYEE_TYPES, default: "Other" },
-    category: { type: String, enum: CATEGORIES, default: "Other", index: true },
+    category: { type: String, default: "Other", trim: true, index: true },
     amount: { type: Number, required: true, min: 0 },
     date: { type: Date, default: Date.now, index: true },
     method: { type: String, default: "Cash" },
@@ -73,7 +73,7 @@ const payableSchema = new mongoose.Schema(
     payeePhone: { type: String, default: "", trim: true },          // WhatsApp number of the person you pay
     payeeType: { type: String, enum: PAYEE_TYPES, default: "Other" },
     title: { type: String, required: true, trim: true },             // what the payment is for
-    category: { type: String, enum: CATEGORIES, default: "Other", index: true },
+    category: { type: String, default: "Other", trim: true, index: true },
     amount: { type: Number, required: true, min: 0 },                // total you have to pay
     date: { type: Date, default: Date.now },
     dueDate: { type: Date },
@@ -100,7 +100,7 @@ export const Payable = mongoose.model("Payable", payableSchema);
 
 // One monthly limit per category.
 const budgetSchema = new mongoose.Schema(
-  { category: { type: String, enum: CATEGORIES, unique: true, required: true }, limit: { type: Number, required: true, min: 0 } },
+  { category: { type: String, unique: true, required: true, trim: true }, limit: { type: Number, required: true, min: 0 } },
   { timestamps: true, versionKey: false, toJSON: idOnly }
 );
 export const Budget = mongoose.model("Budget", budgetSchema);
@@ -112,11 +112,11 @@ const renewalSchema = new mongoose.Schema(
 );
 const workSchema = new mongoose.Schema(
   {
-    employee: { type: String, required: true, trim: true, index: true },
+    employee: { type: String, default: "", trim: true, index: true },
     employeePhone: { type: String, default: "", trim: true },
     site: { type: String, required: true, trim: true },          // area / site / project where the work is done
-    areaSqft: { type: Number, required: true, min: 0 },
-    ratePerSqft: { type: Number, required: true, min: 0 },
+    areaSqft: { type: Number, default: 0, min: 0 },
+    ratePerSqft: { type: Number, default: 0, min: 0 },
     amount: { type: Number, default: 0, min: 0 },                // areaSqft x ratePerSqft, always calculated on the server
     status: { type: String, enum: ["Active", "Completed", "Cancelled"], default: "Active", index: true },
     startedOn: { type: Date },                                   // when the employee started the work
@@ -140,3 +140,10 @@ const settingsSchema = new mongoose.Schema(
   { timestamps: true, versionKey: false }
 );
 export const Settings = mongoose.model("Settings", settingsSchema);
+
+// Expense categories = "profiles". The built-in ones always exist; the user can add more (Home, Site A...).
+export const categorySchema = new mongoose.Schema(
+  { name: { type: String, required: true, trim: true }, key: { type: String, required: true, unique: true } },
+  { timestamps: true, versionKey: false }
+);
+export const Category = mongoose.model("Category", categorySchema);

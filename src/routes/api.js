@@ -1,10 +1,10 @@
 import { Router } from "express";
-import { Sale, Expense, Budget, Settings, Work, Payable, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
+import { Sale, Expense, Budget, Settings, Work, Payable, Category, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
 import { asyncRoute, clean, toDate, escapeRegex } from "../lib/util.js";
 import { money2, settle, balanceOf } from "../lib/payments.js";
 import { notifyCustomer, notifyPayee } from "../lib/notify.js";
 
-export const API_VERSION = "4.0.0"; // frontend checks this to detect an outdated deployment
+export const API_VERSION = "4.1.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
 const STATUSES = ["Paid", "Partial", "Pending", "Overdue", "Cancelled"];
 const METHODS = ["Cash", "Bank Transfer", "Card", "Online", "Cheque", "Not recorded"];
@@ -201,6 +201,41 @@ router.delete("/sales/:id", asyncRoute(async (req, res) => {
   res.json({ deleted: req.params.id });
 }));
 
+
+// ---------- Categories (= expense profiles). Built-in ones + any the user creates ----------
+const MAX_CATEGORY = 40;
+// Returns the stored spelling of a category, creating it if it is new. Returns "" for an empty name.
+async function canonCategory(name) {
+  const v = clean(name).replace(/\s+/g, " ").slice(0, MAX_CATEGORY);
+  if (!v) return "";
+  const builtIn = CATEGORIES.find(c => c.toLowerCase() === v.toLowerCase());
+  if (builtIn) return builtIn;
+  const key = v.toLowerCase();
+  const found = await Category.findOne({ key }).lean();
+  if (found) return found.name;
+  try { await Category.create({ name: v, key }); } catch (e) { if (e.code !== 11000) throw e; }
+  return (await Category.findOne({ key }).lean())?.name || v;
+}
+// Same, but for request bodies: replaces input.category by its canonical name.
+async function withCategory(input) {
+  if (input && input.category !== undefined) input.category = (await canonCategory(input.category)) || "Other";
+  return input;
+}
+
+router.get("/categories", asyncRoute(async (_req, res) => {
+  const stored = (await Category.find().sort({ createdAt: 1 }).lean()).map(c => c.name);
+  const used = [...(await Expense.distinct("category")), ...(await Payable.distinct("category")), ...(await Budget.distinct("category"))];
+  const out = [];
+  [...CATEGORIES, ...stored, ...used].forEach(n => { const v = clean(n); if (v && !out.some(o => o.toLowerCase() === v.toLowerCase())) out.push(v); });
+  res.json(out);
+}));
+router.post("/categories", asyncRoute(async (req, res) => {
+  const raw = clean(req.body?.name);
+  if (!raw) return res.status(400).json({ message: "Enter a profile name." });
+  if (raw.length > MAX_CATEGORY) return res.status(400).json({ message: `Profile name can be at most ${MAX_CATEGORY} characters.` });
+  res.status(201).json({ name: await canonCategory(raw) });
+}));
+
 // ---------- Expenses & monthly budgets ----------
 function buildExpense(input, { partial = false } = {}) {
   const doc = {};
@@ -209,7 +244,7 @@ function buildExpense(input, { partial = false } = {}) {
   if (has("payee")) doc.payee = clean(input.payee);
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
   if (!partial || has("amount")) { doc.amount = Number(input.amount); if (!Number.isFinite(doc.amount) || doc.amount <= 0) return { error: "Amount must be greater than zero." }; }
-  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
+  if (has("category")) doc.category = clean(input.category) || "Other";
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("method")) doc.method = clean(input.method) || "Cash";
   if (has("notes")) doc.notes = clean(input.notes);
@@ -227,7 +262,7 @@ router.get("/expenses", asyncRoute(async (req, res) => {
   res.json((await Expense.find(q).sort({ date: -1 }).limit(2000)).map(d => d.toJSON()));
 }));
 router.post("/expenses", asyncRoute(async (req, res) => {
-  const { doc, error } = buildExpense(req.body || {});
+  const { doc, error } = buildExpense(await withCategory(req.body || {}));
   if (error) return res.status(400).json({ message: error });
   res.status(201).json((await Expense.create(doc)).toJSON());
 }));
@@ -240,10 +275,11 @@ router.delete("/expenses/:id", asyncRoute(async (req, res) => {
 
 router.get("/budgets", asyncRoute(async (_req, res) => res.json((await Budget.find().sort({ category: 1 })).map(b => b.toJSON()))));
 router.put("/budgets/:category", asyncRoute(async (req, res) => {
-  if (!CATEGORIES.includes(req.params.category)) return res.status(400).json({ message: "Unknown category." });
+  const category = await canonCategory(req.params.category);
+  if (!category) return res.status(400).json({ message: "Unknown category." });
   const limit = Number(req.body?.limit);
   if (!Number.isFinite(limit) || limit < 0) return res.status(400).json({ message: "Limit must be zero or more." });
-  const b = await Budget.findOneAndUpdate({ category: req.params.category }, { $set: { limit } }, { upsert: true, new: true, runValidators: true });
+  const b = await Budget.findOneAndUpdate({ category }, { $set: { limit } }, { upsert: true, new: true, runValidators: true });
   res.json(b.toJSON());
 }));
 
@@ -261,7 +297,7 @@ function buildBill(input, { partial = false } = {}) {
     if (doc.payeePhone && (!/^[+\d][\d\s\-()]*$/.test(doc.payeePhone) || digits.length < 7 || digits.length > 15)) return { error: "WhatsApp number must be 7 to 15 digits, e.g. 0300 1234567." };
   }
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
-  if (has("category")) { if (!CATEGORIES.includes(input.category)) return { error: "Unknown category." }; doc.category = input.category; }
+  if (has("category")) doc.category = clean(input.category) || "Other";
   if (has("date")) doc.date = toDate(input.date) || new Date();
   if (has("dueDate")) doc.dueDate = toDate(input.dueDate) || null;
   if (has("method")) doc.method = clean(input.method) || "Not recorded";
@@ -278,7 +314,7 @@ router.get("/payables", asyncRoute(async (req, res) => {
 }));
 
 router.post("/payables", asyncRoute(async (req, res) => {
-  const { doc, error } = buildBill(req.body || {});
+  const { doc, error } = buildBill(await withCategory(req.body || {}));
   if (error) return res.status(400).json({ message: error });
   let paid = Number(req.body?.paidNow ?? 0);
   if (!Number.isFinite(paid) || paid < 0) return res.status(400).json({ message: "Amount paid must be zero or more." });
@@ -294,7 +330,7 @@ router.post("/payables", asyncRoute(async (req, res) => {
 // Update a bill. Asking for "Paid" records the remaining balance as a payment. Returns `notification` when the person should hear about it.
 router.patch("/payables/:id", asyncRoute(async (req, res) => {
   if (!isId(req.params.id)) return res.status(404).json({ message: "Bill not found." });
-  const { doc, error } = buildBill(req.body || {}, { partial: true });
+  const { doc, error } = buildBill(await withCategory(req.body || {}), { partial: true });
   if (error) return res.status(400).json({ message: error });
   const bill = await Payable.findById(req.params.id);
   if (!bill) return res.status(404).json({ message: "Bill not found." });
@@ -363,10 +399,11 @@ router.delete("/payables/:id", asyncRoute(async (req, res) => {
 function buildWork(input, { partial = false } = {}) {
   const doc = {};
   const has = k => input[k] !== undefined;
-  if (!partial || has("employee")) { doc.employee = clean(input.employee); if (!doc.employee) return { error: "Employee name is required." }; }
+  if (has("employee")) doc.employee = clean(input.employee);
   if (!partial || has("site")) { doc.site = clean(input.site); if (!doc.site) return { error: "Area / site is required." }; }
-  if (!partial || has("areaSqft")) { doc.areaSqft = Number(input.areaSqft); if (!Number.isFinite(doc.areaSqft) || doc.areaSqft <= 0) return { error: "Area (sq ft) must be greater than zero." }; }
-  if (!partial || has("ratePerSqft")) { doc.ratePerSqft = Number(input.ratePerSqft); if (!Number.isFinite(doc.ratePerSqft) || doc.ratePerSqft <= 0) return { error: "Rate per sq ft must be greater than zero." }; }
+  // Area and rate are optional (the permission form does not send them). When given, they must be numbers >= 0.
+  if (has("areaSqft")) { doc.areaSqft = Number(input.areaSqft || 0); if (!Number.isFinite(doc.areaSqft) || doc.areaSqft < 0) return { error: "Area (sq ft) must be zero or more." }; }
+  if (has("ratePerSqft")) { doc.ratePerSqft = Number(input.ratePerSqft || 0); if (!Number.isFinite(doc.ratePerSqft) || doc.ratePerSqft < 0) return { error: "Rate per sq ft must be zero or more." }; }
   if (has("employeePhone")) doc.employeePhone = clean(input.employeePhone);
   if (has("status")) { if (!["Active", "Completed", "Cancelled"].includes(input.status)) return { error: "Status must be Active, Completed or Cancelled." }; doc.status = input.status; }
   if (has("startedOn")) doc.startedOn = toDate(input.startedOn) || null;
@@ -388,7 +425,7 @@ router.get("/works", asyncRoute(async (req, res) => {
 router.post("/works", asyncRoute(async (req, res) => {
   const { doc, error } = buildWork(req.body || {});
   if (error) return res.status(400).json({ message: error });
-  doc.amount = money2(doc.areaSqft * doc.ratePerSqft);
+  doc.amount = money2((doc.areaSqft || 0) * (doc.ratePerSqft || 0));
   res.status(201).json((await Work.create(doc)).toJSON());
 }));
 router.patch("/works/:id", asyncRoute(async (req, res) => {

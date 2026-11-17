@@ -5,7 +5,7 @@ Express + MongoDB (Mongoose). Deployed on Vercel: https://finora-4-zentro-by-hmc
 ## Vercel setup (needed once so the database works)
 1. Vercel > this backend project > Settings > Environment Variables: add `MONGODB_URI` (and `MONGODB_DB`, optional).
 2. MongoDB Atlas > Network Access: allow `0.0.0.0/0` (Vercel has no fixed IP).
-3. Redeploy, then open `/api/health`. It must show `"database":"connected"` and `"version":"4.0.0"`.
+3. Redeploy, then open `/api/health`. It must show `"database":"connected"` and `"version":"4.1.0"`.
 
 ## API (no login)
 - `GET/POST /api/sales`, `PATCH/DELETE /api/sales/:invoiceNumber`
@@ -13,10 +13,11 @@ Express + MongoDB (Mongoose). Deployed on Vercel: https://finora-4-zentro-by-hmc
   - status is automatic: **Pending** → **Partial** (some money received) → **Paid** (fully received). `Overdue` is derived from the due date.
 - `POST /api/sales/:invoiceNumber/payments` `{ amount, method, date, note }`: record a part or full payment
 - `DELETE /api/sales/:invoiceNumber/payments/:paymentId`: remove a wrongly entered payment
+- `GET/POST /api/categories`: expense categories ("profiles"). Built-in ones plus any the user creates (Home, Site A...); custom names are accepted by expenses, bills and budgets
 - `GET/POST /api/expenses` (`payee`, `payeeType`; search with `?q=name` or `?payee=Exact Name`), `DELETE /api/expenses/:id`
 - `GET/POST /api/payables`, `PATCH/DELETE /api/payables/:id`: bills you owe to an employee / seller (`payee`, `payeePhone`, `title`, `amount`, `dueDate`, optional `paidNow`)
   - `POST /api/payables/:id/payments`, `DELETE /api/payables/:id/payments/:paymentId`: part payments; each one counts as an expense and the person gets a WhatsApp update
-- `GET/POST /api/works`, `PATCH/DELETE /api/works/:id`: construction work (area × rate) and working permission dates
+- `GET/POST /api/works`, `PATCH/DELETE /api/works/:id`: working permissions (area / employee / permit dates; area × rate are optional)
 - `POST /api/works/:id/renew` `{ permitStart, permitDue, permitNo, note }`: renew a permission (old period kept in history)
 - `GET /api/budgets`, `PUT /api/budgets/:category`
 - `GET/PUT /api/settings`
