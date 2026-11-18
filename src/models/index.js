@@ -134,6 +134,35 @@ const workSchema = new mongoose.Schema(
 );
 export const Work = mongoose.model("Work", workSchema);
 
+// A price quotation for a (possible) customer. It becomes an invoice only when it is confirmed.
+const quoteItemSchema = new mongoose.Schema({ description: { type: String, default: "" }, qty: { type: Number, default: 1, min: 0 }, unit: { type: String, default: "" }, rate: { type: Number, default: 0, min: 0 } }, { _id: false });
+const quoteSectionSchema = new mongoose.Schema({ title: { type: String, default: "" }, items: { type: [quoteItemSchema], default: [] } }, { _id: false });
+const quotationSchema = new mongoose.Schema(
+  {
+    reference: { type: String, unique: true, index: true },
+    title: { type: String, default: "", trim: true },            // scope of work
+    customer: { type: String, default: "", trim: true },         // all customer details are optional until the quotation is confirmed
+    customerPhone: { type: String, default: "", trim: true },
+    customerEmail: { type: String, default: "", trim: true },
+    house: { type: String, default: "", trim: true },
+    address: { type: String, default: "", trim: true },
+    date: { type: Date, default: Date.now },
+    validUntil: { type: Date },
+    sections: { type: [quoteSectionSchema], default: [] },
+    discount: { type: Number, default: 0, min: 0 },
+    taxPercent: { type: Number, default: 0, min: 0, max: 100 },
+    subtotal: { type: Number, default: 0 }, tax: { type: Number, default: 0 }, total: { type: Number, default: 0 },   // always calculated on the server
+    terms: { type: String, default: "" },
+    notes: { type: String, default: "" },
+    extras: { type: [{ label: { type: String, default: "" }, value: { type: String, default: "" }, _id: false }], default: [] },   // extra fields added with the + button
+    status: { type: String, enum: ["Draft", "Sent", "Confirmed", "Rejected"], default: "Draft", index: true },
+    invoiceId: { type: String, default: "" },                    // invoice created when the quotation was confirmed
+    confirmedAt: { type: Date }
+  },
+  { timestamps: true, versionKey: false, toJSON: { transform(_d, ret) { ret.id = ret.reference || String(ret._id); delete ret._id; delete ret.reference; } } }
+);
+export const Quotation = mongoose.model("Quotation", quotationSchema);
+
 // Single-document app settings (business name etc.), so nothing lives only in the browser.
 const settingsSchema = new mongoose.Schema(
   { key: { type: String, default: "main", unique: true }, businessName: { type: String, default: "Finora Services", trim: true }, portfolio: { type: String, default: "", trim: true } },

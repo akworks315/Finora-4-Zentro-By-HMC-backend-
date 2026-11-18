@@ -1,10 +1,11 @@
 import { Router } from "express";
-import { Sale, Expense, Budget, Settings, Work, Payable, Category, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
+import { Sale, Expense, Budget, Settings, Work, Payable, Category, Quotation, CATEGORIES, PAYEE_TYPES } from "../models/index.js";
 import { asyncRoute, clean, toDate, escapeRegex } from "../lib/util.js";
 import { money2, settle, balanceOf } from "../lib/payments.js";
 import { notifyCustomer, notifyPayee } from "../lib/notify.js";
+import { quoteTotals, cleanQuote } from "../lib/quotes.js";
 
-export const API_VERSION = "4.1.0"; // frontend checks this to detect an outdated deployment
+export const API_VERSION = "4.2.0"; // frontend checks this to detect an outdated deployment
 const router = Router();
 const STATUSES = ["Paid", "Partial", "Pending", "Overdue", "Cancelled"];
 const METHODS = ["Cash", "Bank Transfer", "Card", "Online", "Cheque", "Not recorded"];
@@ -236,6 +237,19 @@ router.post("/categories", asyncRoute(async (req, res) => {
   res.status(201).json({ name: await canonCategory(raw) });
 }));
 
+router.delete("/categories/:name", asyncRoute(async (req, res) => {
+  const name = clean(req.params.name), key = name.toLowerCase();
+  if (!name) return res.status(400).json({ message: "Profile name is missing." });
+  if (CATEGORIES.some(c => c.toLowerCase() === key)) return res.status(400).json({ message: "Built-in categories cannot be deleted." });
+  const rx = new RegExp(`^${escapeRegex(name)}$`, "i");
+  // Its expenses and bills are kept: they move to "Other". Its budget limit is removed.
+  await Expense.updateMany({ category: rx }, { $set: { category: "Other" } });
+  await Payable.updateMany({ category: rx }, { $set: { category: "Other" } });
+  await Budget.deleteMany({ category: rx });
+  await Category.deleteOne({ key });
+  res.json({ deleted: name });
+}));
+
 // ---------- Expenses & monthly budgets ----------
 function buildExpense(input, { partial = false } = {}) {
   const doc = {};
@@ -460,6 +474,99 @@ router.delete("/works/:id", asyncRoute(async (req, res) => {
   if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(404).json({ message: "Work not found." });
   const w = await Work.findByIdAndDelete(req.params.id);
   if (!w) return res.status(404).json({ message: "Work not found." });
+  res.json({ deleted: req.params.id });
+}));
+
+// ---------- Quotations (become an invoice only when confirmed) ----------
+async function nextQuoteNumber() {
+  const last = await Quotation.findOne({ reference: /^QT-\d{4,6}$/ }).sort({ reference: -1 }).select("reference").lean();
+  return `QT-${last ? Number(last.reference.slice(3)) + 1 : 1001}`;
+}
+const withTotals = q => { Object.assign(q, quoteTotals(q)); return q; };
+
+router.get("/quotations", asyncRoute(async (_req, res) => {
+  res.json((await Quotation.find().sort({ date: -1, createdAt: -1 }).limit(2000)).map(q => q.toJSON()));
+}));
+
+router.post("/quotations", asyncRoute(async (req, res) => {
+  const { doc, error } = cleanQuote(req.body || {});
+  if (error) return res.status(400).json({ message: error });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const q = withTotals(new Quotation({ ...doc, status: "Draft", reference: await nextQuoteNumber() }));
+      await q.save();
+      return res.status(201).json(q.toJSON());
+    } catch (err) { if (err.code !== 11000) throw err; }
+  }
+  res.status(409).json({ message: "Could not generate a unique quotation number. Please try again." });
+}));
+
+// Edit a quotation. Status may only be moved between Draft, Sent and Rejected here: "Confirmed" is set by /confirm.
+router.patch("/quotations/:id", asyncRoute(async (req, res) => {
+  const { doc, error } = cleanQuote(req.body || {}, { partial: true });
+  if (error) return res.status(400).json({ message: error });
+  const q = await Quotation.findOne({ reference: req.params.id });
+  if (!q) return res.status(404).json({ message: "Quotation not found." });
+  if (q.status === "Confirmed") return res.status(409).json({ message: "A confirmed quotation cannot be changed. Duplicate it to make a new one." });
+  const want = req.body?.status;
+  if (want !== undefined) {
+    if (!["Draft", "Sent", "Rejected"].includes(want)) return res.status(400).json({ message: "Status can be Draft, Sent or Rejected. Use Confirm to make the invoice." });
+    q.status = want;
+  }
+  Object.assign(q, doc);
+  withTotals(q);
+  await q.save();
+  res.json(q.toJSON());
+}));
+
+// Copy a quotation (without customer details) so it can be reused for someone else.
+router.post("/quotations/:id/duplicate", asyncRoute(async (req, res) => {
+  const src = await Quotation.findOne({ reference: req.params.id });
+  if (!src) return res.status(404).json({ message: "Quotation not found." });
+  const days = src.validUntil && src.date ? Math.max(0, Math.round((src.validUntil - src.date) / 864e5)) : 0;
+  const now = new Date();
+  const copy = { title: src.title, date: now, validUntil: days ? new Date(now.getTime() + days * 864e5) : undefined, sections: src.sections.map(s => ({ title: s.title, items: s.items.map(i => ({ description: i.description, qty: i.qty, unit: i.unit, rate: i.rate })) })),
+    discount: src.discount, taxPercent: src.taxPercent, terms: src.terms, notes: src.notes, extras: src.extras.map(e => ({ label: e.label, value: e.value })) };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const q = withTotals(new Quotation({ ...copy, status: "Draft", reference: await nextQuoteNumber() }));
+      await q.save();
+      return res.status(201).json(q.toJSON());
+    } catch (err) { if (err.code !== 11000) throw err; }
+  }
+  res.status(409).json({ message: "Could not generate a unique quotation number. Please try again." });
+}));
+
+// Confirm: the customer accepted. Only now an invoice (a sale) is created for this customer.
+router.post("/quotations/:id/confirm", asyncRoute(async (req, res) => {
+  const { doc, error } = cleanQuote({ customer: req.body?.customer, customerPhone: req.body?.customerPhone, customerEmail: req.body?.customerEmail, house: req.body?.house, address: req.body?.address }, { partial: true });
+  if (error) return res.status(400).json({ message: error });
+  const existing = await Quotation.findOne({ reference: req.params.id });
+  if (!existing) return res.status(404).json({ message: "Quotation not found." });
+  const customer = doc.customer ?? existing.customer;
+  if (!customer) return res.status(400).json({ message: "Add the customer's name before confirming. The invoice is made for that customer." });
+  if (!(existing.total > 0)) return res.status(400).json({ message: "The quotation total is zero. Add items before confirming." });
+  // Claim the quotation first so a double tap cannot create two invoices.
+  const q = await Quotation.findOneAndUpdate({ reference: req.params.id, status: { $in: ["Draft", "Sent"] } }, { $set: { ...doc, status: "Confirmed", confirmedAt: new Date() } }, { new: true });
+  if (!q) return res.status(409).json({ message: existing.status === "Confirmed" ? "This quotation is already confirmed." : "A rejected quotation cannot be confirmed. Set it back to Draft first." });
+  try {
+    const due = toDate(req.body?.dueDate) || new Date(Date.now() + 14 * 864e5);
+    const { sale, error: saleError } = await createSale({ customer: q.customer, customerPhone: q.customerPhone, customerEmail: q.customerEmail, house: q.house, address: q.address,
+      service: q.title || `Works as per quotation ${q.reference}`, amount: q.total, date: new Date(), dueDate: due, status: "Pending",
+      notes: [`As per quotation ${q.reference}`, q.notes].filter(Boolean).join("\n") }, await nextInvoiceNumber());
+    if (saleError) throw new Error(saleError);
+    q.invoiceId = sale.reference;
+    await q.save();
+    res.json({ quotation: q.toJSON(), invoice: sale.toJSON() });
+  } catch (err) {
+    await Quotation.updateOne({ reference: req.params.id }, { $set: { status: existing.status }, $unset: { confirmedAt: 1 } });   // undo the claim if the invoice could not be made
+    throw err;
+  }
+}));
+
+router.delete("/quotations/:id", asyncRoute(async (req, res) => {
+  const q = await Quotation.findOneAndDelete({ reference: req.params.id });
+  if (!q) return res.status(404).json({ message: "Quotation not found." });
   res.json({ deleted: req.params.id });
 }));
 

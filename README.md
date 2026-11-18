@@ -31,3 +31,10 @@ Otherwise the website shows a "Send on WhatsApp" button that opens the customer'
 to a customer who messaged your business number in the last 24 hours; outside that window you need an approved message template.
 
 There is no authentication, so anyone who knows the backend URL can read and change the data. Keep the URL private or enable Vercel Deployment Protection.
+
+## Quotations (v4.2)
+- `GET/POST /api/quotations`: list / create. A quotation has `title` (scope), `sections: [{ title, items: [{ description, qty, unit, rate }] }]`, optional `discount`, `taxPercent`, `terms`, `notes`, `validUntil`, `extras: [{ label, value }]` and **optional** customer details (`customer`, `customerPhone`, `customerEmail`, `house`, `address`). Totals are calculated on the server. Numbers are `QT-1001`, `QT-1002`...
+- `PATCH /api/quotations/:id`: edit (not allowed once confirmed). `status` may be `Draft`, `Sent` or `Rejected`.
+- `POST /api/quotations/:id/duplicate`: copy without customer details, to reuse for someone else.
+- `POST /api/quotations/:id/confirm` `{ customer, customerPhone, customerEmail, house, address, dueDate }`: the customer accepted. **Only now** an invoice is created (`INV-xxxx`) for that customer; the quotation becomes `Confirmed` and keeps `invoiceId`. A customer name is required. Confirming twice is refused.
+- `DELETE /api/categories/:name`: delete a profile you created; its expenses and bills move to "Other".
