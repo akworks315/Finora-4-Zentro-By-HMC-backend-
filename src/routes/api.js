@@ -256,6 +256,7 @@ function buildExpense(input, { partial = false } = {}) {
   const has = k => input[k] !== undefined;
   if (!partial || has("title")) { doc.title = clean(input.title); if (!doc.title) return { error: "Title is required." }; }
   if (has("payee")) doc.payee = clean(input.payee);
+  if (has("address")) doc.address = clean(input.address).slice(0, 200);
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
   if (!partial || has("amount")) { doc.amount = Number(input.amount); if (!Number.isFinite(doc.amount) || doc.amount <= 0) return { error: "Amount must be greater than zero." }; }
   if (has("category")) doc.category = clean(input.category) || "Other";
@@ -271,7 +272,7 @@ router.get("/expenses", asyncRoute(async (req, res) => {
   if (from || to) q.date = { ...(from && { $gte: from }), ...(to && { $lte: to }) };
   // ?q=ali searches the person (employee / seller), title, category and notes. ?payee=Ali matches one person exactly.
   const text = clean(req.query.q).slice(0, 80);
-  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ payee: rx }, { title: rx }, { category: rx }, { notes: rx }]; }
+  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ payee: rx }, { title: rx }, { category: rx }, { notes: rx }, { address: rx }]; }
   if (clean(req.query.payee)) q.payee = new RegExp(`^${escapeRegex(clean(req.query.payee))}$`, "i");
   res.json((await Expense.find(q).sort({ date: -1 }).limit(2000)).map(d => d.toJSON()));
 }));

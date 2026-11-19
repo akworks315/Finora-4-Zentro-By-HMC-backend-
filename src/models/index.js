@@ -56,6 +56,7 @@ const expenseSchema = new mongoose.Schema(
     title: { type: String, required: true, trim: true },
     payee: { type: String, default: "", trim: true, index: true },   // who the money went to: employee, seller, contractor...
     payeeType: { type: String, enum: PAYEE_TYPES, default: "Other" },
+    address: { type: String, default: "", trim: true, maxlength: 200 },   // optional: where the work / purchase was
     category: { type: String, default: "Other", trim: true, index: true },
     amount: { type: Number, required: true, min: 0 },
     date: { type: Date, default: Date.now, index: true },
