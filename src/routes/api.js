@@ -311,6 +311,7 @@ function buildBill(input, { partial = false } = {}) {
     const digits = doc.payeePhone.replace(/\D/g, "");
     if (doc.payeePhone && (!/^[+\d][\d\s\-()]*$/.test(doc.payeePhone) || digits.length < 7 || digits.length > 15)) return { error: "WhatsApp number must be 7 to 15 digits, e.g. 0300 1234567." };
   }
+  if (has("address")) doc.address = clean(input.address).slice(0, 200);
   if (has("payeeType")) { if (!PAYEE_TYPES.includes(input.payeeType)) return { error: "Unknown person type." }; doc.payeeType = input.payeeType; }
   if (has("category")) doc.category = clean(input.category) || "Other";
   if (has("date")) doc.date = toDate(input.date) || new Date();
@@ -324,7 +325,7 @@ function buildBill(input, { partial = false } = {}) {
 router.get("/payables", asyncRoute(async (req, res) => {
   const q = {};
   const text = clean(req.query.q).slice(0, 80);
-  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ payee: rx }, { title: rx }, { category: rx }]; }
+  if (text) { const rx = new RegExp(escapeRegex(text), "i"); q.$or = [{ payee: rx }, { title: rx }, { category: rx }, { address: rx }]; }
   res.json((await Payable.find(q).sort({ date: -1, createdAt: -1 }).limit(2000)).map(b => b.toJSON()));
 }));
 

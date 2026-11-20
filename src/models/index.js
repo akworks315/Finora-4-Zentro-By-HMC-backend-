@@ -73,6 +73,7 @@ const payableSchema = new mongoose.Schema(
     payee: { type: String, required: true, trim: true, index: true },
     payeePhone: { type: String, default: "", trim: true },          // WhatsApp number of the person you pay
     payeeType: { type: String, enum: PAYEE_TYPES, default: "Other" },
+    address: { type: String, default: "", trim: true, maxlength: 200 },   // optional: where the work is
     title: { type: String, required: true, trim: true },             // what the payment is for
     category: { type: String, default: "Other", trim: true, index: true },
     amount: { type: Number, required: true, min: 0 },                // total you have to pay
